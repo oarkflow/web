@@ -23,6 +23,8 @@ import (
 	"time"
 )
 
+var contextPool = sync.Pool{New: func() interface{} { return new(Context) }}
+
 type HandlerFunc func(*Context) error
 
 type Context struct {
@@ -31,15 +33,13 @@ type Context struct {
 	Params   map[string]string
 	index    int
 	handlers []HandlerFunc
+	mu       sync.Mutex
 }
 
 func (c *Context) Next() error {
 	c.index++
-	for c.index < len(c.handlers) {
-		if err := c.handlers[c.index](c); err != nil {
-			return err
-		}
-		c.index++
+	if c.index < len(c.handlers) {
+		return c.handlers[c.index](c)
 	}
 	return nil
 }
@@ -48,16 +48,16 @@ func (c *Context) Abort() {
 	c.index = len(c.handlers)
 }
 
-func (c *Context) JSON(status int, v interface{}) {
+func (c *Context) JSON(status int, v interface{}) error {
 	c.Writer.Header().Set("Content-Type", "application/json")
 	c.Writer.WriteHeader(status)
-	json.NewEncoder(c.Writer).Encode(v)
+	return json.NewEncoder(c.Writer).Encode(v)
 }
 
-func (c *Context) XML(status int, v interface{}) {
+func (c *Context) XML(status int, v interface{}) error {
 	c.Writer.Header().Set("Content-Type", "application/xml")
 	c.Writer.WriteHeader(status)
-	xml.NewEncoder(c.Writer).Encode(v)
+	return xml.NewEncoder(c.Writer).Encode(v)
 }
 
 func (c *Context) BindJSON(v interface{}) error {
@@ -65,6 +65,22 @@ func (c *Context) BindJSON(v interface{}) error {
 		return errors.New("invalid content-type")
 	}
 	return json.NewDecoder(c.Request.Body).Decode(v)
+}
+
+func (c *Context) Send(data []byte) error {
+	_, err := c.Writer.Write(data)
+	return err
+}
+
+func (c *Context) SendString(s string) error {
+	c.Writer.Header().Set("Content-Type", "text/plain")
+	return c.Send([]byte(s))
+}
+
+func (c *Context) HTML(status int, html string) error {
+	c.Writer.Header().Set("Content-Type", "text/html")
+	c.Writer.WriteHeader(status)
+	return c.SendString(html)
 }
 
 func (c *Context) Param(name string) string {
@@ -86,8 +102,9 @@ func (c *Context) Cookie(name string) (string, error) {
 	return cookie.Value, nil
 }
 
-func (c *Context) SetCookie(cookie *http.Cookie) {
+func (c *Context) SetCookie(cookie *http.Cookie) error {
 	http.SetCookie(c.Writer, cookie)
+	return nil
 }
 
 func (c *Context) FileForm(key string) (*multipart.FileHeader, error) {
@@ -115,18 +132,26 @@ type node struct {
 	segment   string
 	isWild    bool
 	paramName string
-	regex     *regexp.Regexp
 	optional  bool
+	regex     *regexp.Regexp
 	children  []*node
 	handlers  map[string][]HandlerFunc
 }
 
 func NewRouter() *Router {
 	return &Router{
-		trees:            make(map[string]*node),
-		notFound:         DefaultNotFoundHandler,
-		methodNotAllowed: DefaultMethodNotAllowedHandler,
-		errorHandler:     DefaultErrorHandler,
+		trees: make(map[string]*node),
+		notFound: func(c *Context) error {
+			c.Writer.WriteHeader(404)
+			c.Writer.Write([]byte("404 page not found"))
+			return nil
+		},
+		methodNotAllowed: func(c *Context) error {
+			c.Writer.WriteHeader(405)
+			c.Writer.Write([]byte("405 method not allowed"))
+			return nil
+		},
+		errorHandler: DefaultErrorHandler,
 	}
 }
 
@@ -144,10 +169,9 @@ func (r *Router) addRoute(method, pattern string, mws []HandlerFunc, handler Han
 	current := root
 	for _, seg := range segments {
 		var nseg string
-		var isWild bool
+		var isWild, optional bool
 		var paramName string
 		var regex *regexp.Regexp
-		var optional bool
 		if seg == "" {
 			continue
 		}
@@ -183,8 +207,8 @@ func (r *Router) addRoute(method, pattern string, mws []HandlerFunc, handler Han
 				segment:   nseg,
 				isWild:    isWild,
 				paramName: paramName,
-				regex:     regex,
 				optional:  optional,
+				regex:     regex,
 				handlers:  make(map[string][]HandlerFunc),
 			}
 			current.children = append(current.children, child)
@@ -198,10 +222,8 @@ func (r *Router) addRoute(method, pattern string, mws []HandlerFunc, handler Han
 func (r *Router) matchChild(n *node, seg string) *node {
 	for _, c := range n.children {
 		if c.isWild {
-			if c.regex != nil {
-				if !c.regex.MatchString(seg) {
-					continue
-				}
+			if c.regex != nil && !c.regex.MatchString(seg) {
+				continue
 			}
 			return c
 		}
@@ -212,61 +234,35 @@ func (r *Router) matchChild(n *node, seg string) *node {
 	return nil
 }
 
-func (r *Router) Handle(method, pattern string, handlers ...HandlerFunc) {
+func (r *Router) Handle(method, pattern string, mws []HandlerFunc, handler HandlerFunc) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(handlers) == 0 {
-		panic("no handler provided")
-	}
-	handler := handlers[len(handlers)-1]
-	mws := handlers[:len(handlers)-1]
 	r.addRoute(method, pattern, mws, handler)
 }
 
-func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	method := req.Method
-	p := strings.Trim(req.URL.Path, "/")
-	segs := []string{}
-	if p != "" {
-		segs = strings.Split(p, "/")
-	}
-	if root, ok := r.trees[method]; ok {
-		params := make(map[string]string)
-		if h, ok := r.search(root, segs, params, method); ok {
-			c := &Context{
-				Writer:   w,
-				Request:  req,
-				Params:   params,
-				handlers: h,
-				index:    -1,
-			}
-			defer func() {
-				if rec := recover(); rec != nil {
-					w.WriteHeader(500)
-					fmt.Fprintf(w, "panic: %v", rec)
-				}
-			}()
-			if err := c.Next(); err != nil {
-				r.errorHandler(c, err)
-			}
-			return
-		}
-	}
-	for m, root := range r.trees {
-		if m == method {
-			continue
-		}
-		if r.matchPattern(root, segs) {
-			r.methodNotAllowed(&Context{Writer: w, Request: req})
-			return
-		}
-	}
-	r.notFound(&Context{Writer: w, Request: req})
+type Group struct {
+	prefix string
+	mw     []HandlerFunc
+	router *Router
+}
+
+func (r *Router) Group(prefix string, mws ...HandlerFunc) *Group {
+	return &Group{prefix: prefix, mw: mws, router: r}
+}
+
+func (g *Group) Handle(method, pattern string, mws []HandlerFunc, handler HandlerFunc) {
+	full := path.Join(g.prefix, pattern)
+	all := append(g.mw, mws...)
+	g.router.Handle(method, full, all, handler)
+}
+
+func (g *Group) GET(pattern string, mws []HandlerFunc, handler HandlerFunc) {
+	g.Handle("GET", pattern, mws, handler)
 }
 
 func (r *Router) search(n *node, segs []string, params map[string]string, method string) ([]HandlerFunc, bool) {
 	if len(segs) == 0 {
-		if h, ok := n.handlers[method]; ok && len(n.handlers) > 0 {
+		if h, ok := n.handlers[method]; ok {
 			return h, true
 		}
 		for _, c := range n.children {
@@ -289,24 +285,11 @@ func (r *Router) search(n *node, segs []string, params map[string]string, method
 				continue
 			}
 			params[c.paramName] = segs[0]
+			return c.handlers[method], true
+		}
+		if c.segment == segs[0] {
 			if h, ok := r.search(c, segs[1:], params, method); ok {
 				return h, true
-			}
-			if c.optional {
-				if h, ok := r.search(c, segs, params, method); ok {
-					return h, true
-				}
-			}
-		} else {
-			if c.segment == segs[0] {
-				if h, ok := r.search(c, segs[1:], params, method); ok {
-					return h, true
-				}
-				if c.optional {
-					if h, ok := r.search(c, segs, params, method); ok {
-						return h, true
-					}
-				}
 			}
 		}
 	}
@@ -315,15 +298,7 @@ func (r *Router) search(n *node, segs []string, params map[string]string, method
 
 func (r *Router) matchPattern(n *node, segs []string) bool {
 	if len(segs) == 0 {
-		if len(n.handlers) > 0 {
-			return true
-		}
-		for _, c := range n.children {
-			if c.optional && r.matchPattern(c, segs) {
-				return true
-			}
-		}
-		return false
+		return len(n.handlers) > 0
 	}
 	for _, c := range n.children {
 		if c.isWild {
@@ -334,38 +309,69 @@ func (r *Router) matchPattern(n *node, segs []string) bool {
 				continue
 			}
 			return true
-		} else {
-			if c.segment == segs[0] {
-				if r.matchPattern(c, segs[1:]) {
-					return true
-				}
-				if c.optional && r.matchPattern(c, segs) {
-					return true
-				}
+		} else if c.segment == segs[0] {
+			if r.matchPattern(c, segs[1:]) {
+				return true
 			}
 		}
 	}
 	return false
 }
 
-func (r *Router) Group(prefix string, mws ...HandlerFunc) *Group {
-	return &Group{prefix: prefix, mw: mws, router: r}
+type responseWriter struct {
+	http.ResponseWriter
+	headerWritten bool
 }
 
-type Group struct {
-	prefix string
-	mw     []HandlerFunc
-	router *Router
+func (rw *responseWriter) WriteHeader(code int) {
+	if !rw.headerWritten {
+		rw.headerWritten = true
+		rw.ResponseWriter.WriteHeader(code)
+	}
 }
 
-func (g *Group) Handle(method, pattern string, handlers ...HandlerFunc) {
-	full := path.Join(g.prefix, pattern)
-	all := append(g.mw, handlers...)
-	g.router.Handle(method, full, all...)
-}
-
-func (g *Group) GET(pattern string, h ...HandlerFunc) {
-	g.Handle("GET", pattern, h...)
+func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	rw := &responseWriter{ResponseWriter: w}
+	method := req.Method
+	pathStr := strings.Trim(req.URL.Path, "/")
+	var segs []string
+	if pathStr != "" {
+		segs = strings.Split(pathStr, "/")
+	}
+	ctx := contextPool.Get().(*Context)
+	ctx.Writer = rw
+	ctx.Request = req
+	ctx.Params = make(map[string]string)
+	ctx.index = -1
+	if root, ok := r.trees[method]; ok {
+		if h, ok := r.search(root, segs, ctx.Params, method); ok {
+			ctx.handlers = h
+			defer func() {
+				if rec := recover(); rec != nil {
+					rw.WriteHeader(500)
+					fmt.Fprintf(rw, "panic: %v", rec)
+				}
+				// Reset and put back to pool
+				ctx.handlers = nil
+				ctx.Params = nil
+				contextPool.Put(ctx)
+			}()
+			if err := ctx.Next(); err != nil {
+				DefaultErrorHandler(ctx, err)
+			}
+			return
+		}
+	}
+	for m, root := range r.trees {
+		if m == method {
+			continue
+		}
+		if r.matchPattern(root, segs) {
+			DefaultMethodNotAllowedHandler(&Context{Writer: w, Request: req})
+			return
+		}
+	}
+	DefaultNotFoundHandler(&Context{Writer: w, Request: req})
 }
 
 func DefaultErrorHandler(c *Context, err error) {
@@ -384,25 +390,24 @@ func DefaultMethodNotAllowedHandler(c *Context) error {
 	return nil
 }
 
+func Recovery() HandlerFunc {
+	return func(c *Context) error {
+		defer func() {
+			if rec := recover(); rec != nil {
+				c.Abort()
+				DefaultErrorHandler(c, fmt.Errorf("panic: %v", rec))
+			}
+		}()
+		return c.Next()
+	}
+}
+
 func Logger() HandlerFunc {
 	return func(c *Context) error {
 		start := time.Now()
 		err := c.Next()
-		log.Printf("%s %s %d %s", c.Request.Method, c.Request.URL.Path, 200, time.Since(start))
+		log.Printf("%s %s %d %s", c.Request.Method, c.Request.URL.Path, http.StatusOK, time.Since(start))
 		return err
-	}
-}
-
-func Recovery() HandlerFunc {
-	return func(c *Context) error {
-		defer func() {
-			if err := recover(); err != nil {
-				c.Writer.WriteHeader(500)
-				c.Writer.Write([]byte(fmt.Sprint(err)))
-				c.Abort()
-			}
-		}()
-		return c.Next()
 	}
 }
 
@@ -416,6 +421,14 @@ func CORS() HandlerFunc {
 			c.Writer.WriteHeader(204)
 			return nil
 		}
+		return c.Next()
+	}
+}
+
+func RateLimiter(rps int) HandlerFunc {
+	ticker := time.NewTicker(time.Second / time.Duration(rps))
+	return func(c *Context) error {
+		<-ticker.C
 		return c.Next()
 	}
 }
@@ -441,14 +454,6 @@ type gzipResponseWriter struct {
 
 func (w *gzipResponseWriter) Write(b []byte) (int, error) {
 	return w.Writer.Write(b)
-}
-
-func RateLimiter(rps int) HandlerFunc {
-	ticker := time.NewTicker(time.Second / time.Duration(rps))
-	return func(c *Context) error {
-		<-ticker.C
-		return c.Next()
-	}
 }
 
 func JWTAuth(secret []byte) HandlerFunc {
@@ -493,54 +498,65 @@ func RequestSizeLimit(max int64) HandlerFunc {
 	}
 }
 
+func CSRFProtection(token string) HandlerFunc {
+	return func(c *Context) error {
+		if c.Request.Method == "POST" || c.Request.Method == "PUT" || c.Request.Method == "PATCH" || c.Request.Method == "DELETE" {
+			if c.Request.Header.Get("X-CSRF-Token") != token {
+				c.Writer.WriteHeader(403)
+				return errors.New("csrf token mismatch")
+			}
+		}
+		return c.Next()
+	}
+}
+
 func HealthCheck() HandlerFunc {
 	return func(c *Context) error {
-		c.JSON(200, map[string]string{"status": "healthy"})
-		return nil
+		return c.JSON(200, map[string]string{"status": "healthy"})
 	}
+}
+
+func mai1n() {
+	http.HandleFunc("/", HelloServer)
+	http.ListenAndServe(":8080", nil)
+}
+
+func HelloServer(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintf(w, "Welcome to the home page!")
 }
 
 func main() {
 	router := NewRouter()
-	router.Use(Recovery(), Logger(), CORS(), SecurityHeaders(), Gzip())
-	router.Handle("GET", "/", func(c *Context) error {
-		c.JSON(200, map[string]string{"message": "Welcome"})
-		return nil
+	// router.Use(Recovery(), Logger(), CORS(), SecurityHeaders(), RateLimiter(10), Gzip(), RequestSizeLimit(1<<20), CSRFProtection("fixedtoken"))
+	router.Handle("GET", "/", nil, func(c *Context) error {
+		return c.SendString("Welcome to the home page!")
 	})
-	router.Handle("GET", "/health", HealthCheck())
-	router.Handle("GET", "/static/*filepath", func(c *Context) error {
+	router.Handle("GET", "/health", nil, HealthCheck())
+	router.Handle("GET", "/static/*filepath", nil, func(c *Context) error {
 		fp := c.Param("filepath")
 		http.ServeFile(c.Writer, c.Request, "./static/"+fp)
 		return nil
 	})
-	router.Handle("GET", "/users/{id}", func(c *Context) error {
-		c.JSON(200, map[string]string{"user": c.Param("id")})
-		return nil
+	router.Handle("GET", "/users/{id}", nil, func(c *Context) error {
+		return c.JSON(200, map[string]string{"user": c.Param("id")})
 	})
-	router.Handle("GET", "/items/{id:\\d+}", func(c *Context) error {
-		c.JSON(200, map[string]string{"item": c.Param("id")})
-		return nil
+	router.Handle("GET", "/items/{id:\\d+}", nil, func(c *Context) error {
+		return c.JSON(200, map[string]string{"item": c.Param("id")})
 	})
-	router.Handle("GET", "/posts/{slug?}", func(c *Context) error {
+	router.Handle("GET", "/posts/{slug?}", nil, func(c *Context) error {
 		slug := c.Param("slug")
 		if slug == "" {
-			c.JSON(200, map[string]string{"posts": "all"})
+			return c.JSON(200, map[string]string{"posts": "all"})
 		} else {
-			c.JSON(200, map[string]string{"post": slug})
+			return c.JSON(200, map[string]string{"post": slug})
 		}
-		return nil
 	})
-	admin := router.Group("/admin", JWTAuth([]byte("secret")))
-	admin.Handle("GET", "/dashboard", func(c *Context) error {
-		c.JSON(200, map[string]string{"dashboard": "admin"})
-		return nil
+	api := router.Group("/api", JWTAuth([]byte("secret")))
+	v1 := api.router.Group("/api/v1")
+	v1.Handle("GET", "/users", nil, func(c *Context) error {
+		return c.JSON(200, []string{"user1", "user2"})
 	})
-	api := router.Group("/api/v1")
-	api.Handle("GET", "/users", func(c *Context) error {
-		c.JSON(200, []string{"user1", "user2"})
-		return nil
-	})
-	api.Handle("POST", "/upload", func(c *Context) error {
+	v1.Handle("POST", "/upload", nil, func(c *Context) error {
 		file, err := c.FileForm("file")
 		if err != nil {
 			c.Writer.WriteHeader(400)
@@ -548,11 +564,13 @@ func main() {
 		}
 		out, err := os.Create("/tmp/" + file.Filename)
 		if err != nil {
+			c.Writer.WriteHeader(500)
 			return err
 		}
 		defer out.Close()
 		in, err := file.Open()
 		if err != nil {
+			c.Writer.WriteHeader(500)
 			return err
 		}
 		defer in.Close()
@@ -560,7 +578,10 @@ func main() {
 		c.Writer.WriteHeader(201)
 		return nil
 	})
-	router.Handle("GET", "/redirect", func(c *Context) error {
+	router.Handle("GET", "/redirect", nil, func(c *Context) error {
+		if c.Request.URL.Path == "/" {
+			return c.JSON(200, map[string]string{"message": "Already at home"})
+		}
 		http.Redirect(c.Writer, c.Request, "/", http.StatusFound)
 		return nil
 	})
