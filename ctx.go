@@ -3,6 +3,9 @@ package web
 import (
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
+	"os"
 
 	"github.com/oarkflow/web/consts"
 )
@@ -27,6 +30,7 @@ type Ctx interface {
 	Session() *Session
 	GetCookie(name string) string
 	SetCookie(cookie *Cookie) error
+	SendFile(filePath string) error
 }
 
 // context contains the request and response data.
@@ -36,6 +40,8 @@ type context struct {
 	server       *server
 	handlerCount uint8
 	session      *Session
+	rawConn      net.Conn // added to store underlying connection
+	hijacked     bool     // if true, do not close connection in HTTP handler
 }
 
 // Send adds the raw byte slice to the response body.
@@ -137,4 +143,41 @@ func (ctx *context) Text(body string) error {
 func (ctx *context) XML(body string) error {
 	ctx.Response().SetHeader(consts.HeaderContentType, consts.HeaderMimeTypeXML)
 	return ctx.SendString(body)
+}
+
+// SendFile serves a file or directory listing at the given file system path.
+func (ctx *context) SendFile(filePath string) error {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		ctx.Status(404)
+		return ctx.SendString("404 Not Found")
+	}
+	if info.IsDir() {
+		entries, err := os.ReadDir(filePath)
+		if err != nil {
+			ctx.Status(500)
+			return ctx.SendString("500 Internal Server Error")
+		}
+		html := "<html><head><meta charset='utf-8'><title>Directory Listing</title></head><body>"
+		html += "<h1>Directory Listing of " + filePath + "</h1><ul>"
+		for _, entry := range entries {
+			html += "<li>" + entry.Name() + "</li>"
+		}
+		html += "</ul></body></html>"
+		ctx.Response().SetHeader("Content-Type", "text/html")
+		return ctx.SendString(html)
+	} else {
+		f, err := os.Open(filePath)
+		if err != nil {
+			ctx.Status(500)
+			return ctx.SendString("500 Internal Server Error")
+		}
+		defer f.Close()
+		data, err := io.ReadAll(f)
+		if err != nil {
+			ctx.Status(500)
+			return ctx.SendString("500 Internal Server Error")
+		}
+		return ctx.Send(data)
+	}
 }

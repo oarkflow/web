@@ -25,6 +25,7 @@ type Server interface {
 	Head(path string, handler Handler)
 	Connect(path string, handler Handler)
 	Trace(path string, handler Handler)
+	Static(prefix, root string) // <-- new method added to interface
 	AddRoute(method string, path string, handler Handler)
 	RemoveRoute(method string, path string)
 	UpdateRoute(method string, path string, handler Handler)
@@ -236,8 +237,8 @@ func (s *server) handleConnection(conn net.Conn) {
 		url    string
 		close  bool
 	)
+	ctx.rawConn = conn // set raw connection for possible websocket upgrade
 	ctx.reader.Reset(conn)
-	defer conn.Close()
 	defer s.contextPool.Put(ctx)
 	for !close {
 		message, err := ctx.reader.ReadString('\n')
@@ -563,4 +564,17 @@ func DefaultErrorHandler(ctx Ctx, err error) error {
 	log.Printf("Error on %s: %v", ctx.Request().Path(), err)
 	ctx.Status(500)
 	return ctx.SendString("500 Internal Server Error")
+}
+
+func (s *server) Static(prefix, root string) { // new Static method
+	s.Get(prefix, func(ctx Ctx) error {
+		filePath := ctx.Request().Path()
+		if strings.HasPrefix(filePath, prefix) {
+			filePath = filePath[len(prefix):]
+		}
+		if filePath == "" || filePath == "/" {
+			filePath = "/index.html"
+		}
+		return ctx.SendFile(root + filePath)
+	})
 }
