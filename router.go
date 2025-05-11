@@ -1,4 +1,4 @@
-package router
+package web
 
 import "strings"
 
@@ -581,4 +581,87 @@ func (node *treeNode[T]) each(callback func(*treeNode[T])) {
 	if node.wildcard != nil {
 		node.wildcard.each(callback)
 	}
+}
+
+// Dynamic route management on Router
+func (router *Router[T]) Remove(method string, path string) {
+	tree := router.selectTree(method)
+	if tree != nil {
+		tree.Remove(path)
+	}
+}
+
+func (router *Router[T]) Update(method string, path string, handler T) {
+	router.Remove(method, path)
+	router.Add(method, path, handler)
+}
+
+// Add a Remove method on Tree
+func (tree *Tree[T]) Remove(path string) {
+	// A minimal implementation: locate the node and reset its data.
+	node := tree.lookupNode(path)
+	if node != nil {
+		var empty T
+		node.data = empty
+	}
+}
+
+// lookupNode performs a basic lookup returning the node pointer.
+func (tree *Tree[T]) lookupNode(path string) *treeNode[T] {
+	var (
+		i    uint
+		node = &tree.root
+	)
+	// skip initial matching if possible...
+	if len(path) > 0 && len(node.prefix) > 0 && path[0] == node.prefix[0] {
+		i = 1
+	}
+	for i < uint(len(path)) {
+		// If we've exhausted this node's prefix, try checking its children.
+		if i >= uint(len(node.prefix)) {
+			matched := false
+			for _, child := range node.children {
+				if child != nil && strings.HasPrefix(path[i:], child.prefix) {
+					node = child
+					i += uint(len(child.prefix))
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return nil
+			}
+			continue
+		}
+		if path[i] != node.prefix[i] {
+			return nil
+		}
+		i++
+	}
+	return node
+}
+
+// Implement Group routing
+
+// Group wraps a common prefix.
+type Group[T any] struct {
+	prefix string
+	router *Router[T]
+}
+
+func (r *Router[T]) Group(prefix string) *Group[T] {
+	return &Group[T]{prefix: prefix, router: r}
+}
+
+// Group methods to add/remove/update routes using the group prefix.
+func (g *Group[T]) Add(method, path string, handler T) {
+	g.router.Add(method, g.prefix+path, handler)
+}
+
+func (g *Group[T]) Remove(method, path string) {
+	g.router.Remove(method, g.prefix+path)
+}
+
+func (g *Group[T]) Update(method, path string, handler T) {
+	g.router.Update(method, g.prefix+path, handler)
 }
